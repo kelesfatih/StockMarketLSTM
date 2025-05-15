@@ -1,7 +1,9 @@
+import os
 import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
+from dotenv import load_dotenv
 from torch.utils.data import DataLoader, TensorDataset
 from torchinfo import summary
 import seaborn as sns
@@ -13,29 +15,37 @@ from sklearn.preprocessing import StandardScaler
 from src.binance_api_endpoints import MarketDataEndpoints
 from src.utils import split_data, sliding_window_with_offset
 
+import neptune
+
+load_dotenv("neptune_credentials.env")
+project_name = os.environ.get("NEPTUNE_PROJECT_NAME")
+api_key = os.environ.get("NEPTUNE_API_TOKEN")
+
+run = neptune.init_run(project=project_name, api_token=api_key)
+params = {
+    "input_sz": 1,
+    "hidden_sz": 64,
+    "n_layers": 3,
+    "output_dim": 1,
+    "dropout": 0.0,
+    "h0": None,
+    "c0": None,
+    "lr": 0.001,
+    "bs": 16,
+    "n_epochs": 20
+}
+run["parameters"] = params
+
+
 # Device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using {device} device")
 
-# Hyperparameters
-hp = {
-    "input_size": 1,
-    "hidden_size": 64,
-    "num_layers": 3,
-    "output_dim": 1,
-    "h0": None,
-    "c0": None,
-    "loss": nn.MSELoss(),
-    "learning_rate": 0.001,
-    "batch_size": 16,
-    "num_epochs": 2
-}
-
 # Fetch Data
 asset = "BTCUSDT"
-time_frame = "4h"
+time_frame = "1d"
 mde = MarketDataEndpoints()
-bitcoin_price_data = mde.fetch_klines(symbol=asset, interval=time_frame, start_str="5 year ago UTC")
+bitcoin_price_data = mde.fetch_klines(symbol=asset, interval=time_frame, start_str="1 year ago UTC")
 
 # Split Data
 train_raw, test_raw = split_data(bitcoin_price_data, 0.8)
@@ -60,52 +70,60 @@ X_test = np.reshape(X_test, (X_test.shape[0], X_test.shape[1], 1))
 X_test = torch.from_numpy(X_test).type(torch.float32)
 
 # Prepare DataLoaders
-train_loader = DataLoader(TensorDataset(train_slider[0], train_slider[1]), batch_size=hp["batch_size"], shuffle=False)
-test_loader = DataLoader(TensorDataset(X_test), batch_size=hp["batch_size"], shuffle=False)
+train_loader = DataLoader(TensorDataset(train_slider[0], train_slider[1]), batch_size=params["bs"], shuffle=False)
+test_loader = DataLoader(TensorDataset(X_test), batch_size=params["bs"], shuffle=False)
 
 
 # Model
 class LSTM(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.lstm = nn.LSTM(input_size=hp["input_size"], hidden_size=hp["hidden_size"], num_layers=hp["num_layers"],
-                            batch_first=True)
-        self.linear = nn.Linear(in_features=hp["hidden_size"], out_features=hp["output_dim"])
+    def __init__(self, input_sz, hidden_sz: int, n_layers: int, output_dim, dropout=0.0):
+        super(LSTM, self).__init__()
+        self.hidden_sz = hidden_sz
+        self.n_layers = n_layers
+        self.lstm = nn.LSTM(input_size=input_sz, hidden_size=hidden_sz, num_layers=n_layers, dropout=dropout, batch_first=True)
+        self.linear = nn.Linear(in_features=hidden_sz, out_features=output_dim)
 
     def forward(self, x, h0=None, c0=None):
         if h0 is None or c0 is None:
-            h0 = torch.zeros(hp["num_layers"], x.size(0), hp["hidden_size"]).to(device)
-            c0 = torch.zeros(hp["num_layers"], x.size(0), hp["hidden_size"]).to(device)
+            h0 = torch.zeros(self.n_layers, x.size(0), self.hidden_sz).to(device)
+            c0 = torch.zeros(self.n_layers, x.size(0), self.hidden_sz).to(device)
         output, (hn, cn) = self.lstm(x, (h0, c0))
         out = self.linear(output[:, -1, :])
         return out, hn, cn
 
 
 # Model Summary
-model = LSTM().to(device)
+model = LSTM(params["input_sz"], params["hidden_sz"], params["n_layers"], params["output_dim"], params["dropout"]).to(device)
+print(model)
 print(summary(model))
 
 # Loss function and optimizer
-loss_fn = hp["loss"]
-optimizer = torch.optim.Adam(model.parameters(), lr=hp["learning_rate"])
+loss_fn = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=params["lr"])
 
 
 def train():
     best_loss = float('inf')
-    for epoch in range(1, hp["num_epochs"] + 1):
+    for epoch in range(params["n_epochs"]):
         model.train()
         running_loss = 0
-        with tqdm(train_loader, desc=f"Epoch {epoch}", unit="batch") as t:
+        with tqdm(train_loader, colour="white", unit="batch") as t:
             for x_batch, y_batch in t:
                 x_batch, y_batch = x_batch.to(device), y_batch.to(device)
-                y_pred, h0, c0 = model(x_batch, h0=hp["h0"], c0=hp["c0"])
+                y_pred, h0, c0 = model(x_batch, h0=params["h0"], c0=params["c0"])
+
                 loss = loss_fn(y_pred, y_batch)
-                optimizer.zero_grad()
+                run["train/batch/loss"].append(loss)
+
                 loss.backward()
                 optimizer.step()
+                optimizer.zero_grad()
+
                 h0 = h0.detach()
                 c0 = c0.detach()
+
                 running_loss += loss.item()
+                t.set_description(f"Epoch [{epoch}/{params['n_epochs']}]")
                 t.set_postfix(loss=loss.item())
         average_loss = running_loss / len(train_loader)
         if average_loss < best_loss:
@@ -154,3 +172,4 @@ def plot_results():
 train()
 test()
 plot_results()
+run.stop()
